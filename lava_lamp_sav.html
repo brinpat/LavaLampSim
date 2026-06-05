@@ -1,0 +1,280 @@
+
+<style>
+  #wrap{display:flex;flex-direction:column;align-items:center;padding:1rem 0}
+  canvas{border-radius:40px;display:block;box-shadow:0 0 0 6px #1a0a00,0 0 0 10px #3d1c00}
+  #controls{display:flex;gap:16px;margin-top:1rem;align-items:center;flex-wrap:wrap;justify-content:center}
+  label{font-size:13px;color:var(--color-text-secondary);display:flex;align-items:center;gap:8px}
+  input[type=range]{width:90px}
+  .val{font-size:13px;font-weight:500;color:var(--color-text-primary);min-width:28px}
+  .badge{font-size:12px;background:var(--color-background-secondary);border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-md);padding:4px 10px;color:var(--color-text-secondary)}
+</style>
+<div id="wrap">
+  <canvas id="c" width="260" height="500"></canvas>
+  <div id="controls">
+    <label>Heat <input type="range" id="heat" min="0.3" max="2.0" step="0.05" value="1.0"><span class="val" id="heatv">1.0</span></label>
+    <label>Particles <input type="range" id="pcount" min="15" max="70" step="5" value="35"><span class="val" id="pv">35</span></label>
+    <span class="badge" id="status">Warming</span>
+  </div>
+</div>
+<script>
+const canvas=document.getElementById('c');
+const ctx=canvas.getContext('2d');
+const W=canvas.width,H=canvas.height;
+function lerp(a,b,t){return a+(b-a)*t}
+function clamp(v,lo,hi){return Math.max(lo,Math.min(hi,v))}
+const FLOOR=H-30,CEIL=30;
+
+class Particle{
+  constructor(id){
+    this.id=id;
+    this.x=W/2+(Math.random()-.5)*70;
+    this.y=lerp(CEIL,FLOOR,0.45+Math.random()*0.5);
+    this.r=5+Math.random()*2.5;
+    this.vx=(Math.random()-.5)*0.8;
+    this.vy=(Math.random()-.5)*0.8;
+    this.temp=0.05+Math.random()*0.1;
+    this.phase=Math.random()*Math.PI*2;
+    // Computed each frame:
+    this.clusterSize=1;   // number of neighbours in contact
+    this.exposedFrac=1.0; // fraction of surface exposed to fluid (SA proxy)
+  }
+
+  lampHW(y){
+    const t=clamp((y-20)/(H-40),0,1);
+    return (W/2-14)*(0.62+0.38*Math.sin(t*Math.PI));
+  }
+
+  update(dt,heatFactor,particles){
+    // --- Measure cluster ---
+    // Count neighbours within bonding distance, estimate exposed surface
+    let neighbours=0;
+    for(let p of particles){
+      if(p===this) continue;
+      const dx=this.x-p.x, dy=this.y-p.y;
+      const d=Math.sqrt(dx*dx+dy*dy);
+      if(d<(this.r+p.r)*1.35) neighbours++;
+    }
+    this.clusterSize=1+neighbours;
+
+    // Exposed fraction: lone particle=1, fully buried in cluster≈0.15
+    // Each neighbour blocks roughly 1/6 of surface (hexagonal packing approximation)
+    this.exposedFrac=clamp(1-neighbours*0.15,0.15,1.0);
+
+    // --- Heat transfer ---
+    // SA:V ratio effect: small isolated = slow (small thermal mass but also small SA contact)
+    //   modelled as: heating rate ∝ exposedFrac (surface in contact with hot fluid)
+    //                but also ∝ 1/clusterSize (interior insulated by neighbours)
+    // Sweet spot: clusterSize ~2-4, exposedFrac ~0.4-0.7
+    const ny=clamp((this.y-CEIL)/(FLOOR-CEIL),0,1);
+    const ambientTemp=clamp(Math.pow(ny,0.55)*heatFactor,0,1);
+    // Heating rate: fastest at medium cluster, slowest alone or in giant blob
+    const savRate=this.exposedFrac/Math.sqrt(this.clusterSize);
+    // Lone particle: exposedFrac=1, clusterSize=1 → rate=1.0 but small mass, heats ok
+    // 2-3 cluster:  exposedFrac≈0.7, clusterSize=2 → rate≈0.5, still good
+    // 8+ cluster:   exposedFrac≈0.15, clusterSize=8 → rate≈0.053, barely heats
+    const heatRate=0.018*savRate*(1+heatFactor*0.4);
+    this.temp+=clamp((ambientTemp-this.temp)*heatRate*dt*16,-0.05,0.05);
+    this.temp=clamp(this.temp,0,1);
+
+    // --- Buoyancy ---
+    // Buoyancy force reduced by cluster mass (bigger = harder to lift)
+    const massPenalty=1/Math.sqrt(this.clusterSize);
+    const hotness=this.temp-0.36;
+    const buoyF=hotness>0
+      ? hotness*-0.65*heatFactor*massPenalty
+      : hotness*-0.20*heatFactor;
+    this.vy+=buoyF*dt;
+
+    // Floor kick for hot particles
+    if(this.y>FLOOR-this.r-3&&this.temp>0.42){
+      this.vy-=0.55*heatFactor*massPenalty*dt;
+    }
+
+    // --- Pairwise forces ---
+    for(let p of particles){
+      if(p.id<=this.id) continue;
+      const dx=this.x-p.x, dy=this.y-p.y;
+      const d=Math.sqrt(dx*dx+dy*dy)+0.001;
+      const nx=dx/d, ny2=dy/d;
+      const minD=this.r+p.r;
+
+      if(d<minD){
+        // Hard repulsion
+        const f=(minD-d)*0.3;
+        this.vx+=nx*f*dt; this.vy+=ny2*f*dt;
+        p.vx-=nx*f*dt;   p.vy-=ny2*f*dt;
+      } else {
+        // Cohesion: purely temperature-dependent, zero when hot
+        const avgT=(this.temp+p.temp)*0.5;
+        // Cohesion only when both cold; fades to 0 by avgT=0.52
+        const coh=clamp(1-avgT/0.52,0,1)*clamp(1-avgT/0.52,0,1); // squared = sharper cutoff
+        const cohR=minD*3.2;
+        if(d<cohR&&coh>0.01){
+          const f=coh*0.018*(1-d/cohR);
+          this.vx-=nx*f*dt; this.vy-=ny2*f*dt;
+          p.vx+=nx*f*dt;   p.vy+=ny2*f*dt;
+        }
+      }
+    }
+
+    // Drag — heavier clusters get more drag
+    const drag=0.965+Math.min(neighbours*0.002,0.015);
+    this.vx*=drag; this.vy*=drag;
+
+    // Thermal noise / wobble
+    this.phase+=dt*0.025;
+    this.vx+=Math.sin(this.phase+this.id*1.3)*0.006;
+    this.vy+=Math.cos(this.phase*0.8+this.id)*0.018;
+
+    // Speed cap
+    const spd=Math.sqrt(this.vx*this.vx+this.vy*this.vy);
+    if(spd>3.2){this.vx=this.vx/spd*3.2;this.vy=this.vy/spd*3.2;}
+
+    // Walls
+    const hw=this.lampHW(this.y);
+    const wL=W/2-hw,wR=W/2+hw;
+    if(this.x-this.r<wL){this.x=wL+this.r;this.vx=Math.abs(this.vx)*0.38;}
+    if(this.x+this.r>wR){this.x=wR-this.r;this.vx=-Math.abs(this.vx)*0.38;}
+    if(this.y-this.r<CEIL){this.y=CEIL+this.r;this.vy=Math.abs(this.vy)*0.38;}
+    if(this.y+this.r>FLOOR){
+      this.y=FLOOR-this.r;
+      this.vy=this.temp>0.42?-Math.abs(this.vy)*0.12:-Math.abs(this.vy)*0.42;
+    }
+
+    this.x+=this.vx*dt;
+    this.y+=this.vy*dt;
+  }
+}
+
+function blobColor(t){
+  const r=Math.round(lerp(55,255,t));
+  const g=Math.round(lerp(8,lerp(22,88,t>.5?(t-.5)*2:0),t));
+  const b=Math.round(lerp(135,12,t));
+  return [r,g,b];
+}
+
+function drawMetaballs(particles){
+  const RES=5,threshold=18;
+  const cols=Math.ceil(W/RES)+2,rows=Math.ceil(H/RES)+2;
+  const field=new Float32Array(cols*rows);
+  const cR=new Float32Array(cols*rows);
+  const cG=new Float32Array(cols*rows);
+  const cB=new Float32Array(cols*rows);
+
+  for(let row=0;row<rows;row++){
+    for(let col=0;col<cols;col++){
+      const px=col*RES,py=row*RES;
+      let v=0,wr=0,wg=0,wb=0,ws=0;
+      for(let p of particles){
+        const dx=px-p.x,dy=py-p.y;
+        const c=(p.r*p.r*14)/(dx*dx+dy*dy+1);
+        v+=c;
+        const w=c*c;
+        const [fr,fg,fb]=blobColor(p.temp);
+        wr+=fr*w;wg+=fg*w;wb+=fb*w;ws+=w;
+      }
+      const i=row*cols+col;
+      field[i]=v;
+      if(ws>0){cR[i]=wr/ws;cG[i]=wg/ws;cB[i]=wb/ws;}
+    }
+  }
+
+  for(let row=0;row<rows-1;row++){
+    for(let col=0;col<cols-1;col++){
+      const i=row*cols+col,v=field[i];
+      if(v<threshold) continue;
+      const alpha=clamp((v-threshold)/28+0.68,0.68,0.94);
+      ctx.fillStyle=`rgba(${Math.round(cR[i])},${Math.round(cG[i])},${Math.round(cB[i])},${alpha.toFixed(2)})`;
+      ctx.fillRect(col*RES,row*RES,RES+1,RES+1);
+    }
+  }
+
+  for(let p of particles){
+    const [fr,fg,fb]=blobColor(p.temp);
+    ctx.beginPath();
+    ctx.arc(p.x,p.y,p.r,0,Math.PI*2);
+    ctx.fillStyle=`rgba(${fr},${fg},${fb},0.82)`;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(p.x-p.r*.27,p.y-p.r*.29,p.r*.27,p.r*.15,-0.5,0,Math.PI*2);
+    ctx.fillStyle=`rgba(255,255,255,${0.07+p.temp*0.06})`;
+    ctx.fill();
+  }
+}
+
+function lampPath(c){
+  c.beginPath();
+  const pts=[];
+  for(let i=0;i<=40;i++){
+    const t=i/40,y=20+t*(H-40);
+    const hw=(W/2-10)*(0.6+0.4*Math.sin(t*Math.PI));
+    pts.push([W/2-hw,y]);
+  }
+  for(let i=40;i>=0;i--){
+    const t=i/40,y=20+t*(H-40);
+    const hw=(W/2-10)*(0.6+0.4*Math.sin(t*Math.PI));
+    pts.push([W/2+hw,y]);
+  }
+  c.moveTo(pts[0][0],pts[0][1]);
+  for(let p of pts) c.lineTo(p[0],p[1]);
+  c.closePath();
+}
+
+let particles=[],heatFactor=1.0,numP=35;
+function initParticles(n){particles=Array.from({length:n},(_,i)=>new Particle(i));}
+initParticles(numP);
+
+let last=performance.now();
+function loop(now){
+  const dt=Math.min((now-last)/16,2.5);last=now;
+  ctx.clearRect(0,0,W,H);
+  ctx.save();lampPath(ctx);ctx.clip();
+
+  const bg=ctx.createLinearGradient(0,0,0,H);
+  bg.addColorStop(0,'rgba(4,1,18,0.97)');
+  bg.addColorStop(0.6,'rgba(8,3,24,0.95)');
+  bg.addColorStop(1,`rgba(${Math.round(36*heatFactor)},${Math.round(7*heatFactor)},4,0.97)`);
+  ctx.fillStyle=bg;ctx.fillRect(0,0,W,H);
+
+  const hg=ctx.createRadialGradient(W/2,H,0,W/2,H,140);
+  hg.addColorStop(0,`rgba(255,${Math.round(60*heatFactor)},0,${0.26*heatFactor})`);
+  hg.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.fillStyle=hg;ctx.fillRect(0,0,W,H);
+
+  for(let p of particles)p.update(dt,heatFactor,particles);
+  drawMetaballs(particles);
+
+  const sh=ctx.createLinearGradient(0,0,W,0);
+  sh.addColorStop(0,'rgba(255,255,255,0.07)');
+  sh.addColorStop(0.15,'rgba(255,255,255,0.02)');
+  sh.addColorStop(0.85,'rgba(255,255,255,0.01)');
+  sh.addColorStop(1,'rgba(255,255,255,0.055)');
+  ctx.fillStyle=sh;lampPath(ctx);ctx.fill();
+  ctx.restore();
+
+  lampPath(ctx);
+  ctx.strokeStyle='rgba(255,255,255,0.15)';ctx.lineWidth=2;ctx.stroke();
+
+  ctx.beginPath();ctx.roundRect(W/2-52,H-22,104,18,6);
+  ctx.fillStyle='#180900';ctx.fill();
+  ctx.strokeStyle='rgba(255,150,30,0.28)';ctx.lineWidth=1;ctx.stroke();
+  ctx.beginPath();ctx.ellipse(W/2,H-22,42,5,0,0,Math.PI*2);
+  ctx.fillStyle=`rgba(255,${Math.round(80*heatFactor)},0,${0.4*heatFactor})`;ctx.fill();
+  ctx.beginPath();ctx.roundRect(W/2-28,8,56,16,4);
+  ctx.fillStyle='#180900';ctx.fill();
+  ctx.strokeStyle='rgba(255,255,255,0.1)';ctx.lineWidth=1;ctx.stroke();
+
+  const avgT=particles.reduce((s,p)=>s+p.temp,0)/particles.length;
+  document.getElementById('status').textContent=avgT>0.52?'Rising':avgT<0.28?'Sinking':'Floating';
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+document.getElementById('heat').addEventListener('input',function(){
+  heatFactor=+this.value;
+  document.getElementById('heatv').textContent=heatFactor.toFixed(1);
+});
+document.getElementById('pcount').addEventListener('input',function(){
+  numP=+this.value;document.getElementById('pv').textContent=numP;initParticles(numP);
+});
+</script>
